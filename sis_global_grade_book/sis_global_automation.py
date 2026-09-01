@@ -128,26 +128,42 @@ def clean_name(value):
 
 def score_for_sis(score, number_format=None):
     """
-    Return the actual value from Excel as-is, without any rounding or formatting.
+    Format the score to match the number of decimal places displayed in Excel.
 
     Examples:
-        85       -> 85
-        85.25    -> 85.25
-        85.5     -> 85.5
-        88       -> 88
+        Excel displays 78.64  -> 78.64
+        Excel displays 80.00  -> 80.00
+        Excel displays 85     -> 85
+        Excel displays 85.25  -> 85.25
     """
 
     if score is None:
         return ""
 
-    # If the Excel cell contains text, preserve it as-is.
+    # Preserve text values.
     if isinstance(score, str):
         return score.strip()
 
-    # Convert number to string without any rounding or decimal manipulation.
-    return str(score)
+    number_format = str(number_format or "")
 
+    # Remove Excel sections such as positive;negative;zero;text.
+    display_format = number_format.split(";")[0]
 
+    # Count the decimal placeholders in the Excel format.
+    if "." in display_format:
+        decimal_part = display_format.split(".", 1)[1]
+
+        # Ignore non-numeric formatting characters after the decimal section.
+        decimal_places = sum(
+            1 for char in decimal_part
+            if char in ("0", "#")
+        )
+
+        if decimal_places > 0:
+            return f"{score:.{decimal_places}f}"
+
+    # No decimal places in the Excel display format.
+    return f"{score:.0f}"
 
 def get_excel_settings(excel_file):
     """
@@ -157,7 +173,6 @@ def get_excel_settings(excel_file):
 
     wb = openpyxl.load_workbook(
         excel_file,
-        read_only=True,
         data_only=True,
     )
 
@@ -225,33 +240,46 @@ def load_students(
 ):
     """
     Read the selected range from the selected worksheet.
+    Returns the grades as they appear in Excel (calculated results).
+    Tries both with and without cached data to get the actual values.
     """
 
-    wb = openpyxl.load_workbook(
+    # Load without data_only first to get formulas
+    wb_formulas = openpyxl.load_workbook(excel_file)
+    ws_formulas = wb_formulas[sheet_name]
+
+    # Load with data_only to get cached values
+    wb_data = openpyxl.load_workbook(
         excel_file,
         data_only=True,
     )
 
-    if sheet_name not in wb.sheetnames:
-        wb.close()
+    if sheet_name not in wb_data.sheetnames:
+        wb_data.close()
+        wb_formulas.close()
         raise ValueError(
             f"Sheet '{sheet_name}' was not found."
         )
 
-    ws = wb[sheet_name]
+    ws_data = wb_data[sheet_name]
 
-    last_row = min(end_row, ws.max_row)
+    last_row = min(end_row, ws_data.max_row)
 
     students = []
 
     for row in range(start_row, last_row + 1):
 
-        raw_name = ws[
+        raw_name = ws_data[
             f"{name_column}{row}"
         ].value
 
-        score_cell = ws[f"{score_column}{row}"]
-        raw_score = score_cell.value
+        score_cell_data = ws_data[f"{score_column}{row}"]
+        raw_score = score_cell_data.value
+
+        # If no value found in cached data, try formula version
+        if raw_score is None:
+            score_cell_formula = ws_formulas[f"{score_column}{row}"]
+            raw_score = score_cell_formula.value
 
         name = clean_name(raw_name)
 
@@ -266,10 +294,11 @@ def load_students(
         students.append({
             "row": row,
             "name": name,
-            "score": score_for_sis(raw_score, score_cell.number_format),
+            "score": score_for_sis(raw_score, score_cell_data.number_format),
         })
 
-    wb.close()
+    wb_data.close()
+    wb_formulas.close()
 
     return students
 

@@ -127,24 +127,28 @@ def clean_name(value):
 
 
 def score_for_sis(score, number_format=None):
-    """
-    Return the actual value from Excel as-is, without any rounding or formatting.
-
-    Examples:
-        85       -> 85
-        85.25    -> 85.25
-        85.5     -> 85.5
-        88       -> 88
-    """
-
     if score is None:
         return ""
 
-    # If the Excel cell contains text, preserve it as-is.
+    # Preserve text values
     if isinstance(score, str):
         return score.strip()
 
-    # Convert number to string without any rounding or decimal manipulation.
+    number_format = str(number_format or "")
+
+    # Whole number format: 85.25 displayed as 85
+    if number_format in ("0", "#,##0"):
+        return str(int(round(score)))
+
+    # One decimal place: 85.25 displayed as 85.3
+    if number_format in ("0.0", "#,##0.0"):
+        return f"{score:.1f}"
+
+    # Two decimal places: preserve trailing zeros
+    if number_format in ("0.00", "#,##0.00"):
+        return f"{score:.2f}"
+
+    # Default: keep the value
     return str(score)
 
 

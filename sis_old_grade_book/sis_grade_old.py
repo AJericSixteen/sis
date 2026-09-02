@@ -35,7 +35,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 # True = pause after every student so you can verify the entry.
 # False = continue automatically.
-TEST_MODE = True
+TEST_MODE = False
 
 WAIT_AFTER_UPDATE = 1.0
 

@@ -20,6 +20,7 @@ IMPORTANT:
 - Keep TEST_MODE=True while testing.
 """
 
+import subprocess
 import time
 import tkinter as tk
 from tkinter import filedialog
@@ -35,9 +36,44 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 # True = pause after every student so you can verify the entry.
 # False = continue automatically.
-TEST_MODE = False
+TEST_MODE = True
 
 WAIT_AFTER_UPDATE = 1.0
+
+# Cloudflare/Turnstile detects a CDP debugger attached at launch, so
+# Playwright never launches the browser itself. Instead the user opens
+# a normal Edge window (below), passes the challenge and logs in by
+# hand, and Playwright only attaches afterwards via connect_over_cdp.
+CDP_PORT = 9222
+EDGE_PROFILE_DIR = str(Path.home() / ".sis_grade_old_edge_profile")
+
+EDGE_EXE_CANDIDATES = [
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+]
+
+
+def find_edge_exe():
+    for candidate in EDGE_EXE_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+
+    return "msedge.exe"
+
+
+def launch_edge_for_manual_login(target_url):
+    edge_exe = find_edge_exe()
+
+    subprocess.Popen(
+        [
+            edge_exe,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={EDGE_PROFILE_DIR}",
+            target_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # =========================
@@ -126,30 +162,9 @@ def clean_name(value):
     return " ".join(str(value).strip().upper().split())
 
 
-def score_for_sis(score, number_format=None):
-    if score is None:
-        return ""
-
-    # Preserve text values
-    if isinstance(score, str):
-        return score.strip()
-
-    number_format = str(number_format or "")
-
-    # Whole number format: 85.25 displayed as 85
-    if number_format in ("0", "#,##0"):
-        return str(int(round(score)))
-
-    # One decimal place: 85.25 displayed as 85.3
-    if number_format in ("0.0", "#,##0.0"):
-        return f"{score:.1f}"
-
-    # Two decimal places: preserve trailing zeros
-    if number_format in ("0.00", "#,##0.00"):
-        return f"{score:.2f}"
-
-    # Default: keep the value
-    return str(score)
+def whole_number(score):
+    """Remove the decimal portion without rounding."""
+    return int(float(score))
 
 
 def get_excel_settings(excel_file):
@@ -253,8 +268,9 @@ def load_students(
             f"{name_column}{row}"
         ].value
 
-        score_cell = ws[f"{score_column}{row}"]
-        raw_score = score_cell.value
+        raw_score = ws[
+            f"{score_column}{row}"
+        ].value
 
         name = clean_name(raw_name)
 
@@ -269,7 +285,7 @@ def load_students(
         students.append({
             "row": row,
             "name": name,
-            "score": score_for_sis(raw_score, score_cell.number_format),
+            "score": whole_number(raw_score),
         })
 
     wb.close()
@@ -502,45 +518,56 @@ def main():
         return
 
     # ---------------------------------
-    # Open SIS
+    # Open SIS (manual launch, so Cloudflare
+    # never sees a CDP debugger attached at
+    # browser startup)
     # ---------------------------------
+
+    print()
+    print("=" * 65)
+    print("                         SIS LOGIN")
+    print("=" * 65)
+    print()
+    print("IMPORTANT: close every open Edge window first.")
+    input("Press ENTER once all Edge windows are closed...")
+
+    launch_edge_for_manual_login(sis_url)
+
+    print()
+    print("1. Log into SIS manually.")
+    print("2. Pass the Cloudflare check yourself if one appears.")
+    print("3. Navigate to the page containing the students.")
+    print("4. Make sure the 'Obtained (%)' fields are visible.")
+    print("5. Return to this PowerShell window.")
+    print()
+
+    input(
+        "Press ENTER when the SIS page is ready..."
+    )
 
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(
-            headless=False
-        )
+        try:
+            browser = p.chromium.connect_over_cdp(
+                f"http://localhost:{CDP_PORT}"
+            )
+        except Exception as e:
+            print(f"Could not connect to Edge on port {CDP_PORT}: {e}")
+            input("Press ENTER to close...")
+            return
 
-        context = browser.new_context()
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
 
-        page = context.new_page()
+        page = None
+        sis_prefix = sis_url.split("?")[0][:40]
 
-        print()
-        print("Opening SIS...")
+        for candidate in context.pages:
+            if candidate.url.startswith(sis_prefix):
+                page = candidate
+                break
 
-        page.goto(
-            sis_url,
-            wait_until="domcontentloaded",
-        )
-
-        # ---------------------------------
-        # Manual SIS login
-        # ---------------------------------
-
-        print()
-        print("=" * 65)
-        print("                         SIS LOGIN")
-        print("=" * 65)
-        print()
-        print("1. Log into SIS manually.")
-        print("2. Navigate to the page containing the students.")
-        print("3. Make sure the 'Obtained (%)' fields are visible.")
-        print("4. Return to this PowerShell window.")
-        print()
-
-        input(
-            "Press ENTER when the SIS page is ready..."
-        )
+        if page is None:
+            page = context.pages[0] if context.pages else context.new_page()
 
         # ---------------------------------
         # Process students
@@ -746,12 +773,13 @@ def main():
         )
 
         print()
-
-        input(
-            "Press ENTER to close the browser..."
+        print(
+            "You can close Edge manually when you're done."
         )
 
-        browser.close()
+        input(
+            "Press ENTER to finish..."
+        )
 
 
 if __name__ == "__main__":

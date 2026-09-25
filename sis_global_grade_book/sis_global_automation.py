@@ -20,6 +20,8 @@ IMPORTANT:
 - Keep TEST_MODE=True while testing.
 """
 
+import re
+import subprocess
 import time
 import tkinter as tk
 from tkinter import filedialog
@@ -38,6 +40,41 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 TEST_MODE = False
 
 WAIT_AFTER_UPDATE = 1.0
+
+# Cloudflare/Turnstile detects a CDP debugger attached at browser launch,
+# so Playwright must not launch the browser itself. Instead, a normal Edge
+# window is launched here, a human passes the Cloudflare check and logs in,
+# and Playwright only attaches afterwards via connect_over_cdp.
+CDP_PORT = 9222
+EDGE_PROFILE_DIR = str(Path.home() / ".sis_global_automation_edge_profile")
+
+EDGE_EXE_CANDIDATES = [
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+]
+
+
+def find_edge_exe():
+    for candidate in EDGE_EXE_CANDIDATES:
+        if Path(candidate).exists():
+            return candidate
+
+    return "msedge.exe"
+
+
+def launch_edge_for_manual_login(target_url):
+    edge_exe = find_edge_exe()
+
+    subprocess.Popen(
+        [
+            edge_exe,
+            f"--remote-debugging-port={CDP_PORT}",
+            f"--user-data-dir={EDGE_PROFILE_DIR}",
+            target_url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # =========================
@@ -128,42 +165,50 @@ def clean_name(value):
 
 def score_for_sis(score, number_format=None):
     """
-    Format the score to match the number of decimal places displayed in Excel.
+    Preserve the decimal places displayed by Excel.
 
     Examples:
-        Excel displays 78.64  -> 78.64
-        Excel displays 80.00  -> 80.00
-        Excel displays 85     -> 85
-        Excel displays 85.25  -> 85.25
+        85       -> 85
+        85.25    -> 85.25
+        85.50    -> 85.50
+        88.00    -> 88.00
     """
 
     if score is None:
         return ""
 
-    # Preserve text values.
+    # If the Excel cell contains text, preserve it.
     if isinstance(score, str):
         return score.strip()
 
-    number_format = str(number_format or "")
+    # Check Excel's number format.
+    if number_format:
+        fmt = str(number_format)
 
-    # Remove Excel sections such as positive;negative;zero;text.
-    display_format = number_format.split(";")[0]
+        # Remove quoted text and escaped characters.
+        fmt_clean = re.sub(r'"[^"]*"|\\.', "", fmt)
 
-    # Count the decimal placeholders in the Excel format.
-    if "." in display_format:
-        decimal_part = display_format.split(".", 1)[1]
+        if "." in fmt_clean:
+            decimal_part = fmt_clean.split(".", 1)[1]
 
-        # Ignore non-numeric formatting characters after the decimal section.
-        decimal_places = sum(
-            1 for char in decimal_part
-            if char in ("0", "#")
-        )
+            # Ignore sections after scientific notation.
+            decimal_part = re.split(r"[;Ee]", decimal_part)[0]
 
-        if decimal_places > 0:
-            return f"{score:.{decimal_places}f}"
+            decimal_places = sum(
+                1 for ch in decimal_part
+                if ch in "0#?"
+            )
 
-    # No decimal places in the Excel display format.
-    return f"{score:.0f}"
+            if decimal_places > 0:
+                return f"{float(score):.{decimal_places}f}"
+
+    # No decimal formatting: keep whole numbers as whole numbers.
+    if float(score).is_integer():
+        return str(int(float(score)))
+
+    return str(score)
+
+
 
 def get_excel_settings(excel_file):
     """
@@ -173,6 +218,7 @@ def get_excel_settings(excel_file):
 
     wb = openpyxl.load_workbook(
         excel_file,
+        read_only=True,
         data_only=True,
     )
 
@@ -240,46 +286,36 @@ def load_students(
 ):
     """
     Read the selected range from the selected worksheet.
-    Returns the grades as they appear in Excel (calculated results).
-    Tries both with and without cached data to get the actual values.
     """
 
-    # Load without data_only first to get formulas
-    wb_formulas = openpyxl.load_workbook(excel_file)
-    ws_formulas = wb_formulas[sheet_name]
-
-    # Load with data_only to get cached values
-    wb_data = openpyxl.load_workbook(
+    wb = openpyxl.load_workbook(
         excel_file,
         data_only=True,
     )
 
-    if sheet_name not in wb_data.sheetnames:
-        wb_data.close()
-        wb_formulas.close()
+    if sheet_name not in wb.sheetnames:
+        wb.close()
         raise ValueError(
             f"Sheet '{sheet_name}' was not found."
         )
 
-    ws_data = wb_data[sheet_name]
+    ws = wb[sheet_name]
 
-    last_row = min(end_row, ws_data.max_row)
+    last_row = min(end_row, ws.max_row)
 
     students = []
 
     for row in range(start_row, last_row + 1):
 
-        raw_name = ws_data[
+        raw_name = ws[
             f"{name_column}{row}"
         ].value
 
-        score_cell_data = ws_data[f"{score_column}{row}"]
-        raw_score = score_cell_data.value
+        score_cell = ws[f"{score_column}{row}"]
+        raw_score = score_cell.value
 
-        # If no value found in cached data, try formula version
-        if raw_score is None:
-            score_cell_formula = ws_formulas[f"{score_column}{row}"]
-            raw_score = score_cell_formula.value
+        score_cell = ws[f"{score_column}{row}"]
+        raw_score = score_cell.value
 
         name = clean_name(raw_name)
 
@@ -294,11 +330,10 @@ def load_students(
         students.append({
             "row": row,
             "name": name,
-            "score": score_for_sis(raw_score, score_cell_data.number_format),
+            "score": score_for_sis(raw_score, score_cell.number_format),
         })
 
-    wb_data.close()
-    wb_formulas.close()
+    wb.close()
 
     return students
 
@@ -528,45 +563,62 @@ def main():
         return
 
     # ---------------------------------
-    # Open SIS
+    # Manual SIS login (Edge launched directly, not by Playwright,
+    # so Cloudflare/Turnstile doesn't see a CDP debugger at load time)
     # ---------------------------------
+
+    print()
+    print("=" * 65)
+    print("                         SIS LOGIN")
+    print("=" * 65)
+    print()
+    print("IMPORTANT: close every open Edge window first.")
+
+    input("Press ENTER once all Edge windows are closed...")
+
+    launch_edge_for_manual_login(sis_url)
+
+    print()
+    print("1. Log into SIS manually.")
+    print("2. Navigate to the page containing the students.")
+    print("3. Make sure the 'Obtained (%)' fields are visible.")
+    print("4. Return to this PowerShell window.")
+    print()
+
+    input(
+        "Press ENTER when the SIS page is ready..."
+    )
 
     with sync_playwright() as p:
 
-        browser = p.chromium.launch(
-            headless=False
+        try:
+            browser = p.chromium.connect_over_cdp(
+                f"http://localhost:{CDP_PORT}"
+            )
+        except Exception as e:
+            print(f"Could not connect to Edge on port {CDP_PORT}: {e}")
+            input("Press ENTER to close...")
+            return
+
+        context = (
+            browser.contexts[0]
+            if browser.contexts
+            else browser.new_context()
         )
 
-        context = browser.new_context()
+        page = None
 
-        page = context.new_page()
+        for candidate in context.pages:
+            if candidate.url.startswith(sis_url.split("?")[0][:40]):
+                page = candidate
+                break
 
-        print()
-        print("Opening SIS...")
-
-        page.goto(
-            sis_url,
-            wait_until="domcontentloaded",
-        )
-
-        # ---------------------------------
-        # Manual SIS login
-        # ---------------------------------
-
-        print()
-        print("=" * 65)
-        print("                         SIS LOGIN")
-        print("=" * 65)
-        print()
-        print("1. Log into SIS manually.")
-        print("2. Navigate to the page containing the students.")
-        print("3. Make sure the 'Obtained (%)' fields are visible.")
-        print("4. Return to this PowerShell window.")
-        print()
-
-        input(
-            "Press ENTER when the SIS page is ready..."
-        )
+        if page is None:
+            page = (
+                context.pages[0]
+                if context.pages
+                else context.new_page()
+            )
 
         # ---------------------------------
         # Process students
@@ -787,7 +839,9 @@ def main():
 
         input("Press ENTER only when you are finished reviewing...")
 
-        browser.close()
+        print()
+        print("This script does not own the Edge session, so it will")
+        print("stay open. Close Edge manually whenever you're done.")
 
 
 if __name__ == "__main__":
